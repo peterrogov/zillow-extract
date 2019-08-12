@@ -1,0 +1,17 @@
+{
+    "defaultSeverity": "warning",
+    "extends": [
+        "tslint:recommended"
+    ],
+    "jsRules": {},
+    "rules": {
+        "trailing-comma": [ false ]
+    },
+    "rulesDirectory": [],
+    "linterOptions": {
+        "exclude": [
+            "./src/prisma-client.ts",
+            "src/simulate/**/*"
+        ]
+    }
+}
