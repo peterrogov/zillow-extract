@@ -4,15 +4,40 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import moment from 'moment';
+import gMaps from "@google/maps";
 
 var player = require('play-sound')();
 
+const googleMapsClient = gMaps.createClient({
+    key: "AIzaSyBoIP544YKCeEKdTScTG1jLrQZkcU_UKDk",
+    Promise
+});
+
+async function googleTranslateAddress(address: string): Promise<string> {
+    try {
+        const res = await googleMapsClient.geocode({ address }).asPromise();
+        if (res && res.json && res.json.results && res.json.results.length) {
+            const result = res.json.results[0];
+            if (result.formatted_address && result.formatted_address.length) {
+                return result.formatted_address;
+            }
+        }
+    } catch {
+
+    }
+
+    return "";
+}
+
 interface ISearchListingResult {
     address?: string,
+    rawAddress?: string,
     url?: string
 }
 
 interface IPropertyData {
+    inputRow?: number,
+    status?: "SUCCESS" | "FAIL" | "GOOGLE-SUCCESS",
     rawAddress?: string,
     extractionTime?: string,
     url?: string,
@@ -38,7 +63,7 @@ const options = new firefox.Options();
 const dataFile = `./data/data.json`;
 let failedFile = "failed.txt";
 const outputFile = "./data/output-compiled.csv";
-const csvHeaders = "Input address;Time;Zillow Address;Property URL;Beds;Baths;Area;Zestimate;Zestimate Rent;Value;";
+const csvHeaders = "STATUS;ZILLOW ADDRESS;PROPERTY URL;BEDS;BATHS;AREA;ZESTIMATE;ZESTIMATE RENT;VALUE";
 
 type AddrCount = {
     address: string,
@@ -54,6 +79,10 @@ let successItems: number = 0;
 let failedItems: number = 0;
 let startTime = new Date();
 
+const inputFile = './data/input.csv';
+const inputHeaders: string[] = [];
+const inputRows: string[][] = [];
+
 const driver = new selenium.Builder()
     .setFirefoxOptions(options)
     .forBrowser('firefox')
@@ -67,15 +96,15 @@ const timeoutAsync = (ms: number): Promise<any> => {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-let alert:any = null;
+let alert: any = null;
 
-async function ringAlert() { 
+async function ringAlert() {
     await killAlert();
     alert = player.play('alert.mp3');
 }
 
 async function killAlert() {
-    if(alert && !alert.killed) {
+    if (alert && !alert.killed) {
         alert.kill();
     }
 }
@@ -85,6 +114,42 @@ async function waitForPageLoad() {
         const readyState = await driver.executeScript('return document.readyState');
         return readyState === 'complete';
     });
+}
+
+async function readInputFile() {
+    if (!fs.existsSync(inputFile)) {
+        console.error("Input file does not exist");
+        return;
+    }
+
+    const inputLines = await readFileLines(inputFile);
+
+    if (inputLines.length < 2) {
+        console.error("Input file must have two or more lines");
+        return;
+    }
+
+    const headerLine = inputLines[0];
+    const headerLineSplit = headerLine.split(';');
+    for (let x = 0; x < headerLineSplit.length; x++) {
+        const header = headerLineSplit[x].toUpperCase().trim();
+        inputHeaders.push(header);
+    }
+
+    for (let x = 1; x < inputLines.length; x++) {
+        const rowSplit = inputLines[x].split(';');
+        if (rowSplit.length !== inputHeaders.length) {
+            console.log(`Input line #${x + 1} does not match header column count. Skipping.`);
+            continue;
+        }
+
+        const inputRowData: string[] = [];
+        for (let t = 0; t < rowSplit.length; t++) {
+            inputRowData.push(rowSplit[t].trim());
+        }
+
+        inputRows.push(inputRowData);
+    }
 }
 
 async function getSearchResults(type: "RENT" | "BUY", searchQuery: string): Promise<ISearchListingResult[]> {
@@ -530,7 +595,7 @@ async function extractPropertyData(property: ISearchListingResult): Promise<IPro
     } else if (property.address) {
         await driver.get(`https://www.zillow.com/`);
         await waitForPageLoad();
-        propertyData.rawAddress = property.address;
+        propertyData.rawAddress = property.rawAddress ? property.rawAddress : property.address;
         const searchInput = await driver.findElement(selenium.By.css('.react-autosuggest__input'));
         await searchInput.clear();
         await searchInput.sendKeys(`${property.address}`);
@@ -547,7 +612,7 @@ async function extractPropertyData(property: ISearchListingResult): Promise<IPro
             console.log('Waiting for captcha to be resolved');
             await ringAlert();
         }
-        await timeoutAsync(3000);
+        await timeoutAsync(5000);
         captchaCycle++;
     }
 
@@ -596,14 +661,24 @@ async function main() {
     }
     */
 
+    await readInputFile();
+
+    if (!inputHeaders.length || !inputRows.length) {
+        console.log('No input data available.');
+        return;
+    }
+
+    const inputAddressColumn = inputHeaders.indexOf('NORMALIZED ADDRESS');
+    if (inputAddressColumn === -1) {
+        console.log('Input file does not contain NORMALIZED ADDRESS column.');
+        return;
+    }
+
     let dataDirFiles = fs.readdirSync('./data/');
-    const inputFiles: string[] = [];
     const failedFiles: string[] = [];
     for (let r = 0; r < dataDirFiles.length; r++) {
         const file = dataDirFiles[r];
-        if (file.startsWith('input-') && file.endsWith(".txt")) {
-            inputFiles.push(file);
-        } else if (file.startsWith('failed-') && file.endsWith(".txt")) {
+        if (file.startsWith('failed') && file.endsWith(".txt")) {
             failedFiles.push(file);
         }
     }
@@ -623,27 +698,31 @@ async function main() {
         const json = fs.readFileSync(dataFile).toString();
         allPropertiesData = JSON.parse(json);
         console.log(`Loaded ${allPropertiesData.length} records from previous run`);
-    }
 
+        let deletedCount = 0;
+        for (let t = 0; t < allPropertiesData.length; t++) {
+            let isFound = false;
+            for (let x = 0; x < inputRows.length; x++) {
+                const address = inputRows[x][inputAddressColumn];
+                if (allPropertiesData[t].rawAddress === address) {
+                    isFound = true;
+                    break;
+                }
+            }
 
-
-    if (!inputFiles.length) {
-        console.error("No input files");
-        return;
-    }
-
-    for (let t = 0; t < inputFiles.length; t++) {
-        const addressesFile = `./data/${inputFiles[t]}`;
-
-        if (!fs.existsSync(addressesFile)) {
-            console.error("Input file does not exist or not available");
-            return;
+            if (!isFound) {
+                allPropertiesData.splice(t, 1);
+                t = -1;
+                deletedCount++;
+            }
         }
 
-        console.log(`Input file: ${addressesFile}`);
-        await processAddresses(addressesFile);
-        console.log();
+        if (deletedCount > 0) {
+            console.log(`Deleted ${deletedCount} records from the dataset as they are not present in the input`);
+        }
     }
+
+    await processAddresses();
 
     let finishTime = new Date();
 
@@ -671,18 +750,20 @@ async function main() {
     let sm = moment(startTime);
     let fm = moment(finishTime);
 
-    console.log("Unique addresses:", addrCounts.length);
-    
-    fs.writeFileSync('./data/addr-unique.csv', "Address;Occurences;Status\n");
-    for(let x = 0; x < addrCounts.length; x++){
-        const status = await addressIsProcessed(addrCounts[x].address);
-        fs.appendFileSync('./data/addr-unique.csv', `${addrCounts[x].address};${addrCounts[x].count};${status ? 'OK' : 'FAIL'}\n`);
-    }
-
     console.log();
 
+    failedItems = 0;
+    successItems = 0;
+    for (let x = 0; x < allPropertiesData.length; x++) {
+        if (allPropertiesData[x].status === "SUCCESS" || allPropertiesData[x].status === "GOOGLE-SUCCESS") {
+            successItems++;
+        } else {
+            failedItems++;
+        }
+    }
+
     console.log("\n=== Processing stats ===\n");
-    console.log("Total items:", totalItems);
+    console.log("Total items:", allPropertiesData.length);
     console.log("Failed items:", failedItems);
     console.log("Success items:", successItems);
     console.log(`Success rate: ${((successItems / totalItems) * 100).toFixed(2)}%`);
@@ -691,73 +772,89 @@ async function main() {
     console.log('Zillow Extract finished');
 }
 
-async function processAddresses(addressesFile: string) {
-    let addr: string[] = await readFileLines(addressesFile);
+async function processAddresses() {
 
-    console.log(addressesFile, addr.length, allPropertiesData.length);
-    for(let t = 0; t < addr.length; t++){        
-        const address = addr[t].toUpperCase().trim();
-        let found: boolean = false;
-        for(let x = 0; x < addrCounts.length; x++){
-            if(addrCounts[x].address === address) {
-                addrCounts[x].count++;
-                found = true;
-                break;
-            }
-        }
-
-        if(!found){
-            addrCounts.push({
-                address: address,
-                count: 1
-            });
-        }        
+    const inputAddressColumn = inputHeaders.indexOf('NORMALIZED ADDRESS');
+    if (inputAddressColumn === -1) {
+        console.log('Input file does not contain NORMALIZED ADDRESS column.');
+        return;
     }
 
-    return;
-
-    failedFile = `./data/failed-${path.basename(addressesFile, ".txt")}.txt`;
-    //processedFile = `./data/processed-${path.basename(addressesFile, ".txt")}.txt`;
-
-    console.log(`Extracting data for ${addr.length} properties`);
-    for (let x = 0; x < addr.length; x++) {
-        console.log(`[${x + 1}/${addr.length}] Extracting property data from ${addr[x]}`);
-        const address = addr[x];
+    console.log(`Processing ${inputRows.length} records from input`);
+    failedFile = `./data/failed.txt`;
+    for (let x = 0; x < inputRows.length; x++) {
+        const address = inputRows[x][inputAddressColumn];
+        console.log(`[${x + 1}/${inputRows.length}] Extracting property data from ${address}`);
 
         totalItems++;
 
-        if (await addressIsProcessed(address)) {
-            console.log('This address is already processed. Skipping.');
-            successItems++;
+        let propertyData = findDataByRawAddress(address);
+
+        if (propertyData) {
+            propertyData.inputRow = x;
+            if (propertyData.status === "SUCCESS" || propertyData.status === "GOOGLE-SUCCESS") {
+                console.log('This address is already processed. Skipping.');
+                successItems++;
+
+            } else {
+                console.log('This address has failed previously. Skipping.');
+                failedItems++;
+            }
             continue;
         }
+        let retryWithGoogle = false;
+        let keepTrying = true;
 
-        if (allFailedAddresses.includes(address.toUpperCase().trim())) {
-            console.log('This address has failed previously. Skipping.');
-            failedItems++;
-            continue;
-        }
+        do {
+            let extractAddress = address;
+            if (retryWithGoogle) {
+                extractAddress = await googleTranslateAddress(address);
+                if (!address.length) {
+                    keepTrying = false;
+                    break;
+                }
+            }
 
-        let propertyData: IPropertyData | null = null;
-        try {
-            propertyData = await extractPropertyData({ address: addr[x] });
-        } catch (err) {
-            console.log(`Error: ${err.message}`);
-            console.log(`Retrying item in 5 sec.`);
-            x--;
-            await timeoutAsync(5000);
-            continue;
-        }
+            try {
+                propertyData = await extractPropertyData({ address: extractAddress, rawAddress: address });
+                if (propertyData) {
+                    propertyData.inputRow = x;
+                    propertyData.status = retryWithGoogle ? "GOOGLE-SUCCESS" : "SUCCESS";
+                    keepTrying = false;
+                } else {
+                    propertyData = {
+                        inputRow: x,
+                        rawAddress: address,
+                        status: "FAIL",
+                        facts: []
+                    }
+                }
+            } catch (err) {
+                console.log(`Error: ${err.message}`);
+                console.log(`Retrying item in 5 sec.`);
+                await timeoutAsync(5000);
+                continue;
+            }
 
-        if (!propertyData) {
-            console.log('Could not get property data');
-            fs.appendFileSync(failedFile, address + "\n");
-            allFailedAddresses.push(address.toUpperCase().trim());
-            failedItems++;
-            continue;
-        }
+            if (!propertyData || propertyData.status === "FAIL") {
+                console.log('Could not extract property data');
+                if(!retryWithGoogle){
+                    console.log('Trying to decode address with google maps and retry');
+                    retryWithGoogle = true;
+                }else{
+                    propertyData = {
+                        inputRow: x,
+                        rawAddress: address,
+                        status: "FAIL",
+                        facts: []
+                    }
+                    keepTrying = false;
+                }
+            }else if(propertyData.status === "GOOGLE-SUCCESS"){
+                console.log("Property data extracted after decode by google");
+            }
+        } while (keepTrying);
 
-        successItems++;
         allPropertiesData.push(propertyData);
 
         const propJson = JSON.stringify(allPropertiesData, null, 2);
@@ -788,38 +885,56 @@ async function readFileLines(file: string): Promise<string[]> {
     return lines;
 }
 
-async function addressIsProcessed(addr: string): Promise<boolean> {
+function findDataByRawAddress(addr: string): IPropertyData | null {
     for (let x = 0; x < allPropertiesData.length; x++) {
         if (allPropertiesData[x].rawAddress) {
             if (allPropertiesData[x].rawAddress.toUpperCase().trim() === addr.toUpperCase().trim()) {
-                console.log(`${allPropertiesData[x].rawAddress}\n${allPropertiesData[x].address}\n`);
-                return true;
+                return allPropertiesData[x];
             }
         }
     }
 
-    return false;
+    return null;
 }
 
+
 function getCsvHeaderLine(): string {
-    let headerLine = csvHeaders;
-    headerLine += factsLabels.join(";");
+
+    let headerLine = inputHeaders.join(';') + ";" + csvHeaders;
+
+    if (factsLabels.length > 0) {
+        headerLine += ';' + factsLabels.join(";");
+    }
+
     return headerLine;
 }
 
 function getPropertyCsvLine(property: IPropertyData): string {
-    const csvColumns: string[] = [
-        property.rawAddress,
-        property.extractionTime,
-        property.address,
-        property.url,
-        property.beds !== undefined ? property.beds.toString() : "N/A",
-        property.baths !== undefined ? property.baths.toString() : "N/A",
-        property.area !== undefined ? property.area.toString() : "N/A",
-        property.zestimate !== undefined ? property.zestimate.toString() : "N/A",
-        property.zestimateRent !== undefined ? property.zestimateRent.toString() : "N/A",
-        property.value !== undefined ? property.value.toString() : "N/A",
+    const csvColumns: string[] = [];
+
+    if (property.inputRow === undefined) {
+        return "";
+    }
+
+    for (let x = 0; x < inputRows[property.inputRow].length; x++) {
+        csvColumns.push(inputRows[property.inputRow][x]);
+    }
+
+    const data = [
+        property.status ? property.status : "UNKNOWN",
+        property.address ? property.address : "",
+        property.url ? property.url : "",
+        property.beds !== undefined ? property.beds.toString() : "",
+        property.baths !== undefined ? property.baths.toString() : "",
+        property.area !== undefined ? property.area.toString() : "",
+        property.zestimate !== undefined ? property.zestimate.toString() : "",
+        property.zestimateRent !== undefined ? property.zestimateRent.toString() : "",
+        property.value !== undefined ? property.value.toString() : "",
     ];
+
+    for (let x = 0; x < data.length; x++) {
+        csvColumns.push(data[x]);
+    }
 
     for (let x = 0; x < factsLabels.length; x++) {
         const label = factsLabels[x];
@@ -834,7 +949,7 @@ function getPropertyCsvLine(property: IPropertyData): string {
         }
 
         if (!isFound) {
-            csvColumns.push('N/A');
+            csvColumns.push('');
         }
     }
 
